@@ -1,10 +1,18 @@
 '''
 *****************************************************************************
-*File : habd_api.py
-*Module : habd_dlm
-*Purpose : habd data logging module API class for database operations
-*Author : HABD Team
-*Copyright : Copyright 202, Lab to Market Innovations Private Limited
+* File        : habd_api.py
+* Module      : habd_dlm
+* Version     : 1.1
+* Date        : 28/04/2025
+* Description : HABD Processing API for Data Logging Module
+* Author      : Akash B, Kausthubha N K
+* Copyright   : Copyright 2025, Lab to Market Innovations Private Limited
+*               Bangalore
+* Change Log  :
+*   Version   Date        Author          Description
+*   -------   ----------  --------------  ----------------------------------------
+*   1.0       28/04/2025  Akash B           Initial version
+*   1.1       10/09/2025  Kausthubha N K    Final Reviewer
 *****************************************************************************
 '''
 
@@ -19,9 +27,10 @@ from peewee import *
 from habd_model import TrainProcessedInfo, TrainConsolidatedInfo, EventInfo, ErrorInfo, HealthInfo
 
 from habd_dlm_conf import HabdDlmConfRead
-from habd_common.habd_event_error_pub import EventErrorPub
-from habd_common.habd_log import Log
-from habd_common.MqttClient import MqttClient
+from habd_event_error_pub import EventErrorPub
+from habd_log import Log
+from mqtt_client import *
+sys.path.insert(1, "/home/l2m/habd-v1/src/habd_common")
 
 
 class HabdAPI:
@@ -33,6 +42,7 @@ class HabdAPI:
         self.error_msg_id = 0
         self.dpu_id = cfg_obj.dpu_id
         self.dlm_pub = EventErrorPub(mq_client, self.dpu_id)
+        self.psql_db = None  # Initialize psql_db
 
     def connect_database(self, config):
         '''Establish connection with database'''
@@ -48,12 +58,12 @@ class HabdAPI:
                 self.dlm_pub.publish_error_info("dlm", "DLM-ERROR-011", EventErrorPub.CRITICAL,
                                                 "habd_api: connect_database: database name missing")
             else:
-                psql_db = PostgresqlDatabase(db_name, user=user, password=password, host=host, port=port)
-                if psql_db:
+                self.psql_db = PostgresqlDatabase(db_name, user=user, password=password, host=host, port=port)
+                if self.psql_db:
                     try:
-                        psql_db.connect()
+                        self.psql_db.connect()
                         Log.logger.info(f'habd_api: database connection successful')
-                        return psql_db
+                        return self.psql_db
                     except Exception as e:
                         Log.logger.critical(f'habd_api: connect_database: {e}', exc_info=True)
                         self.dlm_pub.publish_error_info("dlm", "DLM-ERROR-012", EventErrorPub.CRITICAL,
@@ -70,181 +80,364 @@ class HabdAPI:
     def insert_train_processed_info(self, data):
         '''insert train processed info in database table'''
         try:
-            TrainProcessedInfo()
             json_data = json.loads(data)
 
-            temp_diff = None
-            max_left_temp = None
-            max_right_temp = None
-            max_temp_difference = None
+            Log.logger.warning(f'=== TRAIN PROCESSED INFO ===')
+            Log.logger.warning(f'Train ID: {json_data["train_id"]}')
+            Log.logger.warning(f'Number of axle_ids: {len(json_data["axle_ids"])}')
+
+            # Check if temperature data is available in this message
+            has_temp_data = "temp_lefts" in json_data and "temp_rights" in json_data
+            Log.logger.warning(f'Temperature data available: {has_temp_data}')
+
+            # Default values for required fields
             wheel_status_left = 1
             wheel_status_right = 1
 
-            # Filter out invalid temperature readings (-1 values)
-            valid_left_temps = [temp for temp in json_data.get("temp_lefts", []) if temp != -1]
-            valid_right_temps = [temp for temp in json_data.get("temp_rights", []) if temp != -1]
-
-            # Calculate the maximum values across all VALID axles
-            max_left_temp = max(valid_left_temps) if valid_left_temps else None
-            max_right_temp = max(valid_right_temps) if valid_right_temps else None
-
-            # Calculate max temperature difference
-            valid_temp_differences = []
+            # Use get() method with default empty lists for temperature fields
             temp_lefts = json_data.get("temp_lefts", [])
             temp_rights = json_data.get("temp_rights", [])
+            
+            # Get rake_ids - handle both "rake_id" and "rake_ids" keys
+            rake_ids = json_data.get("rake_id", json_data.get("rake_ids", []))
 
-            for left, right in zip(temp_lefts, temp_rights):
-                if left != -1 and right != -1:
-                    valid_temp_differences.append(abs(left - right))
-                elif left != -1 and right == -1:
-                    valid_temp_differences.append(abs(left))
-                elif right != -1 and left == -1:
-                    valid_temp_differences.append(abs(right))
+            Log.logger.warning(f'Temperature data - Left: {len(temp_lefts)}, Right: {len(temp_rights)}')
+            Log.logger.warning(f'Rake IDs available: {len(rake_ids)}')
 
-            max_temp_difference = max(valid_temp_differences) if valid_temp_differences else None
-
-            '''Check train_consolidated info is available for the given train_id'''
-            train_record = self.select_train_consolidated_info(json_data["train_id"])
-
-            if len(train_record) == 0:
-                Log.logger.critical(f'Train consolidated info for {json_data["train_id"]} - not found')
-            else:
-                Log.logger.info(f'Train consolidated info for {json_data["train_id"]} - found')
-
-                '''list'''
-                list_tuple = []
-                d = []
+            inserted_count = 0
+            updated_count = 0
+            
+            # Use transaction for atomic operations
+            with self.psql_db.atomic():
                 for i in range(len(json_data["axle_ids"])):
+                    axle_id = json_data["axle_ids"][i]
+                    rake_id = rake_ids[i] if i < len(rake_ids) else None
                     
-                    if i < len(json_data["temp_lefts"]) and i < len(json_data["temp_rights"]):
-                        left_temp = json_data["temp_lefts"][i] if json_data["temp_lefts"][i] != -1 else None
-                        right_temp = json_data["temp_rights"][i] if json_data["temp_rights"][i] != -1 else None
+                    # Log rake_id for debugging (first 5 axles)
+                    if i < 5:
+                        Log.logger.warning(f'Axle {axle_id} rake_id: {rake_id}')
 
-                        if left_temp is not None and right_temp is not None:
-                            temp_diff = round(abs(left_temp - right_temp), 2)
-                        elif left_temp is not None:
-                            temp_diff = round(abs(left_temp), 2)
-                        elif right_temp is not None:
-                            temp_diff = round(abs(right_temp), 2)
+                    # Handle temperature data properly
+                    if i < len(temp_lefts) and temp_lefts[i] is not None and temp_lefts[i] != -1:
+                        left_temp = float(temp_lefts[i])
+                    else:
+                        left_temp = None
+
+                    if i < len(temp_rights) and temp_rights[i] is not None and temp_rights[i] != -1:
+                        right_temp = float(temp_rights[i])
+                    else:
+                        right_temp = None
+
+                    # Calculate temperature difference
+                    if left_temp is not None and right_temp is not None:
+                        temp_difference = abs(left_temp - right_temp)
+                    else:
+                        temp_difference = None
+
+                    try:
+                        # Use INSERT ON CONFLICT (UPSERT) with all required fields including rake_id
+                        query = '''
+                            INSERT INTO train_processed_info 
+                            (ts, train_id, dpu_id, axle_id, axle_speed, rake_id, 
+                             left_temp, right_temp, wheel_status_left, wheel_status_right, 
+                             temp_difference)
+                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                            ON CONFLICT (train_id, axle_id) 
+                            DO UPDATE SET
+                                ts = EXCLUDED.ts,
+                                axle_speed = COALESCE(EXCLUDED.axle_speed, train_processed_info.axle_speed),
+                                rake_id = COALESCE(EXCLUDED.rake_id, train_processed_info.rake_id),
+                                left_temp = COALESCE(EXCLUDED.left_temp, train_processed_info.left_temp),
+                                right_temp = COALESCE(EXCLUDED.right_temp, train_processed_info.right_temp),
+                                temp_difference = COALESCE(EXCLUDED.temp_difference, train_processed_info.temp_difference)
+                        '''
+                        
+                        params = (
+                            json_data["ts"],
+                            json_data["train_id"],
+                            json_data["dpu_id"],
+                            axle_id,
+                            json_data["axle_speeds"][i] if i < len(json_data.get("axle_speeds", [])) else None,
+                            rake_id,
+                            left_temp,
+                            right_temp,
+                            wheel_status_left,
+                            wheel_status_right,
+                            temp_difference
+                        )
+                        
+                        cursor = self.psql_db.execute_sql(query, params)
+                        
+                        if cursor.rowcount == 1:
+                            # For logging purposes
+                            if has_temp_data and (left_temp is not None or right_temp is not None):
+                                updated_count += 1
+                            else:
+                                inserted_count += 1
+                                
+                    except Exception as e:
+                        if 'duplicate' in str(e).lower() or 'unique' in str(e).lower():
+                            Log.logger.warning(f'Duplicate detected for train {json_data["train_id"]} axle {axle_id}, attempting update')
+                            # Try to update the existing record with ALL fields including rake_id
+                            try:
+                                update_query = '''
+                                    UPDATE train_processed_info 
+                                    SET ts = %s,
+                                        axle_speed = COALESCE(%s, axle_speed),
+                                        rake_id = COALESCE(%s, rake_id),
+                                        left_temp = COALESCE(%s, left_temp),
+                                        right_temp = COALESCE(%s, right_temp),
+                                        temp_difference = COALESCE(%s, temp_difference)
+                                    WHERE train_id = %s AND axle_id = %s
+                                '''
+                                update_params = (
+                                    json_data["ts"],
+                                    json_data["axle_speeds"][i] if i < len(json_data.get("axle_speeds", [])) else None,
+                                    rake_id,
+                                    left_temp,
+                                    right_temp,
+                                    temp_difference,
+                                    json_data["train_id"],
+                                    axle_id
+                                )
+                                cursor = self.psql_db.execute_sql(update_query, update_params)
+                                if cursor.rowcount > 0:
+                                    updated_count += 1
+                                    Log.logger.debug(f'Updated existing record for axle {axle_id} with rake_id: {rake_id}')
+                            except Exception as update_error:
+                                Log.logger.error(f'Failed to update duplicate record for axle {axle_id}: {update_error}')
                         else:
-                            temp_diff = None
+                            Log.logger.error(f'Failed to process record for axle {axle_id}: {e}')
 
-                    d.append(json_data["ts"])
-                    d.append(json_data["train_id"])
-                    '''dpu_id insert internally with every record'''
-                    d.append(json_data["dpu_id"])
-                    d.append(json_data["axle_ids"][i])
-                    d.append(json_data["axle_speeds"][i])
-                    d.append(json_data["rake_ids"][i])
-                    d.append(wheel_status_left)
-                    d.append(wheel_status_right)
-                    d.append(json_data["temp_lefts"][i])
-                    d.append(json_data["temp_rights"][i])
-                    d.append(round(temp_diff, 2))
-                    d.append(max_left_temp)
-                    d.append(max_right_temp)
-                    d.append(round(max_temp_difference, 2))
-                    t = tuple(d)
-                    list_tuple.append(t)
-                    d.clear()
-
-                # Log.logger.info(f'Insert data information: {list_tuple}')
-
-                TrainProcessedInfo.insert_many(list_tuple, fields=[
-                    TrainProcessedInfo.ts, TrainProcessedInfo.train_id, TrainProcessedInfo.dpu_id,
-                    TrainProcessedInfo.axle_id, TrainProcessedInfo.axle_speed,
-                    TrainProcessedInfo.rake_id,
-                    TrainProcessedInfo.wheel_status_left, TrainProcessedInfo.wheel_status_right,
-                    TrainProcessedInfo.left_temp, TrainProcessedInfo.right_temp, TrainProcessedInfo.temp_difference,
-                    TrainProcessedInfo.max_left_temp, TrainProcessedInfo.max_right_temp,
-                    TrainProcessedInfo.max_temp_difference
-                        ]).execute()
-
-                Log.logger.warning(f'Insert train_processed_info: {json_data["train_id"]} records inserted')
+            Log.logger.warning(f'Train processed info: {json_data["train_id"]} - {inserted_count} inserted, {updated_count} updated')
+                
         except Exception as e:
-            Log.logger.critical(f'insert_train_processed_info: {json_data["train_id"]} Exception raised: {e}', exc_info=True)
+            Log.logger.critical(f'insert_train_processed_info: Exception raised: {e}', exc_info=True)
             self.dlm_pub.publish_error_info("dlm", "DLM-ERROR-014", EventErrorPub.CRITICAL,
                                             "habd_api: insert_train_processed_info: Exception raised: " + str(e))
 
-    def train_processed_info_mem_mgmt(self, train_id):
-        '''Perform memory management of train_processed_info table'''
+    def insert_habd_temp_info(self, data):
+        '''Insert temperature data from HABD info message'''
         try:
-            query = TrainProcessedInfo.delete().where(TrainProcessedInfo.train_id == train_id)
-            query.execute()
-            Log.logger.info(f'Deleted {train_id} from train_processed_info table')
+            json_data = json.loads(data)
+            train_id = json_data["train_id"]
+            
+            Log.logger.warning(f'=== HABD TEMPERATURE INFO ===')
+            Log.logger.warning(f'Train ID: {train_id}')
+            Log.logger.warning(f'Number of axle_ids: {len(json_data["axle_ids"])}')
 
+            updated_count = 0
+            
+            # Use transaction for atomic operations
+            with self.psql_db.atomic():
+                for i in range(len(json_data["axle_ids"])):
+                    axle_id = json_data["axle_ids"][i]
+                    
+                    # Get temperature values
+                    left_temp = float(json_data["temp_lefts"][i]) if i < len(json_data["temp_lefts"]) else None
+                    right_temp = float(json_data["temp_rights"][i]) if i < len(json_data["temp_rights"]) else None
+                    
+                    # Calculate temperature difference
+                    if left_temp is not None and right_temp is not None:
+                        temp_difference = abs(left_temp - right_temp)
+                    else:
+                        temp_difference = None
+
+                    try:
+                        # First, try to UPDATE existing record - DON'T create new ones
+                        update_query = '''
+                            UPDATE train_processed_info 
+                            SET left_temp = %s, right_temp = %s, temp_difference = %s
+                            WHERE train_id = %s AND axle_id = %s
+                        '''
+                        
+                        params = (left_temp, right_temp, temp_difference, train_id, axle_id)
+                        cursor = self.psql_db.execute_sql(update_query, params)
+                        
+                        if cursor.rowcount > 0:
+                            updated_count += 1
+                            Log.logger.debug(f'Updated temperature for axle {axle_id}: L={left_temp}, R={right_temp}')
+                        else:
+                            # If no record was updated, log warning but don't create new record
+                            Log.logger.warning(f'No existing record found for train {train_id} axle {axle_id} to update temperatures')
+                            # The record should be created by train_processed_info message
+                            
+                    except Exception as e:
+                        Log.logger.error(f'Failed to update temperature data for axle {axle_id}: {e}')
+
+            Log.logger.warning(f'HABD temp info: {train_id} - {updated_count} records updated')
+            
+            # Update consolidated info with max temperatures
+            self.update_consolidated_temperatures(train_id)
+            
         except Exception as e:
-            Log.logger.critical(f'habd_api: train_processed_info_mem_mgmt: exception: {e}', exc_info=True)
-            self.dlm_pub.publish_error_info("dlm", "DLM-ERROR-015", EventErrorPub.CRITICAL,
-                                            "habd_api: train_processed_info_mem_mgmt: exception: " + str(e))
+            Log.logger.critical(f'insert_habd_temp_info: Exception raised: {e}', exc_info=True)
+            self.dlm_pub.publish_error_info("dlm", "DLM-ERROR-027", EventErrorPub.CRITICAL,
+                                            "habd_api: insert_habd_temp_info: Exception raised: " + str(e))
 
-    def test_insert_train_processed_info(self):
-        '''test insert operation with sample data'''
+    def update_consolidated_temperatures(self, train_id):
+        '''Update max temperatures in consolidated info'''
         try:
-            tp_info_table = TrainProcessedInfo()
-            tp_info_table.ts = time.time()
-            tp_info_table.train_id = "T" + time.strftime("%Y%m%d%H%M%S")
-            tp_info_table.dpu_id = "DPU_01"
-            tp_info_table.axle_id = 1
-            tp_info_table.axle_speed = 80
-            tp_info_table.avg_dyn_load_left = 5.5
-            tp_info_table.avg_dyn_load_right = 5.5
-            tp_info_table.max_dyn_load_left = 10.5
-            tp_info_table.max_dyn_load_right = 10.5
-            tp_info_table.ilf_left = 1.9
-            tp_info_table.ilf_right = 1.9
-            tp_info_table.wheel_status_left = 1
-            tp_info_table.wheel_status_right = 1
-            tp_info_table.train_type = 'LHB'
-            tp_info_table.save()
-            Log.logger.info(
-                f'habd_api: test_insert_train_processed_info: record inserted: {tp_info_table.train_id}')
-        except Exception as e:
-            Log.logger.critical(f"habd_api: test_insert_train_processed_info : Exception generated: {e}", exc_info=True)
-            self.dlm_pub.publish_error_info("dlm", "DLM-ERROR-016", EventErrorPub.CRITICAL,
-                                            "habd_api: test_insert_train_processed_info : exception: " + str(e))
+            # Calculate max temperatures from processed data
+            processed_records = self.select_train_processed_info(train_id)
+            max_left_temp = None
+            max_right_temp = None
+            max_temp_difference = None
 
-    def select_train_processed_info(self, train_id):
-        '''Get store records from train_processed_info'''
-        try:
-            model_name = TrainProcessedInfo()
-            records = model_name.select().where(train_id == train_id)
-            return records
+            if processed_records:
+                left_temps = [r.left_temp for r in processed_records if r.left_temp is not None]
+                right_temps = [r.right_temp for r in processed_records if r.right_temp is not None]
+                temp_diffs = [r.temp_difference for r in processed_records if r.temp_difference is not None]
+                
+                if left_temps:
+                    max_left_temp = max(left_temps)
+                if right_temps:
+                    max_right_temp = max(right_temps)
+                if temp_diffs:
+                    max_temp_difference = max(temp_diffs)
+
+            # Update consolidated record using direct SQL
+            try:
+                # First try to update existing record
+                update_query = '''
+                    UPDATE train_consolidated_info 
+                    SET max_left_temp = %s, max_right_temp = %s, max_temp_difference = %s
+                    WHERE train_id = %s
+                '''
+                params = (max_left_temp, max_right_temp, max_temp_difference, train_id)
+                cursor = self.psql_db.execute_sql(update_query, params)
+                
+                if cursor.rowcount == 0:
+                    # No record exists, we'll skip creating one here
+                    Log.logger.warning(f'No consolidated record found for {train_id} to update temperatures')
+                else:
+                    Log.logger.warning(f'Updated max temps for {train_id}: L={max_left_temp}, R={max_right_temp}, Diff={max_temp_difference}')
+                    
+            except Exception as e:
+                Log.logger.error(f'Error updating consolidated temperatures for {train_id}: {e}')
+                
         except Exception as e:
-            Log.logger.critical("habd_api: select_train_processed_info : exception : {e}", exc_info=True)
-            self.dlm_pub.publish_error_info("dlm", "DLM-ERROR-017", EventErrorPub.CRITICAL,
-                                            "habd_api: select_train_processed_info : exception : " + str(e))
+            Log.logger.error(f'Error updating consolidated temperatures for {train_id}: {e}')
 
     def insert_train_consolidated_info(self, data):
         '''insert train consolidated info in train_consolidated_info table'''
         try:
             json_data = json.loads(data)
 
-            train_table = TrainConsolidatedInfo()
-            train_table.train_id = json_data["train_id"]
-            '''insert dpu_id internally with every record'''
-            train_table.dpu_id = self.dpu_id
-            train_table.entry_time = json_data["train_entry_time"]
-            train_table.exit_time = json_data["train_exit_time"]
-            train_table.total_axles = json_data["total_axles"]
-            train_table.total_wheels = json_data["total_wheels"]
-            train_table.direction = json_data["direction"]
-            train_table.train_speed = json_data["train_speed"]
-            train_table.train_type = json_data["train_type"]
-            train_table.train_processed = json_data["train_processed"]
-            train_table.remark = json_data["remark"]
-            train_table.max_left_temp = json_data["max_left_temp"]
-            train_table.max_right_temp = json_data["max_right_temp"]
-            train_table.max_temp_difference = json_data["max_temp_difference"]
-            
-            train_table.save()
-            ''' perform memory management '''
-            self.train_consolidated_info_mem_mgmt()
-            Log.logger.warning(f'Insert_train_consolidated_info: {json_data["train_id"]} record inserted')
+            # Calculate max temperatures from processed data
+            processed_records = self.select_train_processed_info(json_data["train_id"])
+            max_left_temp = None
+            max_right_temp = None
+            max_temp_difference = None
+
+            if processed_records:
+                left_temps = [r.left_temp for r in processed_records if r.left_temp is not None]
+                right_temps = [r.right_temp for r in processed_records if r.right_temp is not None]
+                temp_diffs = [r.temp_difference for r in processed_records if r.temp_difference is not None]
+                
+                if left_temps:
+                    max_left_temp = max(left_temps)
+                if right_temps:
+                    max_right_temp = max(right_temps)
+                if temp_diffs:
+                    max_temp_difference = max(temp_diffs)
+
+            try:
+                # Use direct SQL to avoid ON CONFLICT issues
+                # First check if record exists
+                check_query = "SELECT 1 FROM train_consolidated_info WHERE train_id = %s"
+                cursor = self.psql_db.execute_sql(check_query, (json_data["train_id"],))
+                exists = cursor.fetchone() is not None
+                
+                if exists:
+                    # Update existing record
+                    update_query = '''
+                        UPDATE train_consolidated_info 
+                        SET dpu_id = %s, entry_time = %s, exit_time = %s, total_axles = %s,
+                            total_wheels = %s, direction = %s, train_speed = %s, train_type = %s,
+                            train_processed = %s, remark = %s, max_left_temp = %s,
+                            max_right_temp = %s, max_temp_difference = %s
+                        WHERE train_id = %s
+                    '''
+                    params = (
+                        self.dpu_id,
+                        json_data["train_entry_time"],
+                        json_data["train_exit_time"],
+                        json_data["total_axles"],
+                        json_data["total_wheels"],
+                        json_data["direction"],
+                        json_data["train_speed"],
+                        json_data["train_type"],
+                        json_data["train_processed"],
+                        json_data["remark"],
+                        max_left_temp,
+                        max_right_temp,
+                        max_temp_difference,
+                        json_data["train_id"]
+                    )
+                    self.psql_db.execute_sql(update_query, params)
+                    Log.logger.warning(f'Updated consolidated info: {json_data["train_id"]}')
+                else:
+                    # Insert new record
+                    insert_query = '''
+                        INSERT INTO train_consolidated_info 
+                        (train_id, dpu_id, entry_time, exit_time, total_axles, total_wheels,
+                         direction, train_speed, train_type, train_processed, remark,
+                         max_left_temp, max_right_temp, max_temp_difference)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    '''
+                    params = (
+                        json_data["train_id"],
+                        self.dpu_id,
+                        json_data["train_entry_time"],
+                        json_data["train_exit_time"],
+                        json_data["total_axles"],
+                        json_data["total_wheels"],
+                        json_data["direction"],
+                        json_data["train_speed"],
+                        json_data["train_type"],
+                        json_data["train_processed"],
+                        json_data["remark"],
+                        max_left_temp,
+                        max_right_temp,
+                        max_temp_difference
+                    )
+                    self.psql_db.execute_sql(insert_query, params)
+                    Log.logger.warning(f'Inserted consolidated info: {json_data["train_id"]}')
+                
+                ''' perform memory management '''
+                self.train_consolidated_info_mem_mgmt()
+                
+            except Exception as e:
+                Log.logger.error(f'Error in consolidated info for {json_data["train_id"]}: {e}')
+                
         except Exception as e:
             Log.logger.critical(f'habd_api: insert_train_consolidated_info: {json_data["train_id"]} exception: {e}', exc_info=True)
             self.dlm_pub.publish_error_info("dlm", "DLM-ERROR-018", EventErrorPub.CRITICAL,
                                             "habd_api: insert_train_consolidated_info : exception : " + str(e))
+
+    def train_processed_info_mem_mgmt(self, train_id):
+        '''Perform memory management of train_processed_info table'''
+        try:
+            query = TrainProcessedInfo.delete().where(TrainProcessedInfo.train_id == train_id)
+            deleted_count = query.execute()
+            Log.logger.info(f'Deleted {deleted_count} records for {train_id} from train_processed_info table')
+
+        except Exception as e:
+            Log.logger.critical(f'habd_api: train_processed_info_mem_mgmt: exception: {e}', exc_info=True)
+            self.dlm_pub.publish_error_info("dlm", "DLM-ERROR-015", EventErrorPub.CRITICAL,
+                                            "habd_api: train_processed_info_mem_mgmt: exception: " + str(e))
+
+    def select_train_processed_info(self, train_id):
+        '''Get store records from train_processed_info'''
+        try:
+            records = TrainProcessedInfo.select().where(TrainProcessedInfo.train_id == train_id)
+            return list(records)
+        except Exception as e:
+            Log.logger.critical(f"habd_api: select_train_processed_info : exception : {e}", exc_info=True)
+            self.dlm_pub.publish_error_info("dlm", "DLM-ERROR-017", EventErrorPub.CRITICAL,
+                                            "habd_api: select_train_processed_info : exception : " + str(e))
+            return []
 
     def train_consolidated_info_mem_mgmt(self):
         '''Perform memory management of train_consolidated_info table'''
@@ -255,14 +448,15 @@ class HabdAPI:
             Log.logger.info(f'No.of records in train_consolidated_info table: {total_records}')
 
             if total_records > 5000:
-                Log.logger.info(records[0].train_id)
+                oldest_train_id = records[0].train_id
+                Log.logger.info(f'Deleting oldest record: {oldest_train_id}')
                 query = TrainConsolidatedInfo.delete().where(
-                    TrainConsolidatedInfo.train_id == records[0].train_id)
+                    TrainConsolidatedInfo.train_id == oldest_train_id)
                 query.execute()
                 Log.logger.info(f'Deleted first record in train_consolidated_info table')
 
                 '''train_processed_info memory management'''
-                self.train_processed_info_mem_mgmt(records[0].train_id)
+                self.train_processed_info_mem_mgmt(oldest_train_id)
 
         except Exception as e:
             Log.logger.critical(f'habd_api: train_consolidated_info_mem_mgmt : exception: {e}', exc_info=True)
@@ -274,12 +468,13 @@ class HabdAPI:
         try:
             Log.logger.info(f'select_train_consolidated_info of {train_id}')
             records = TrainConsolidatedInfo.select().where(
-                TrainConsolidatedInfo.train_id == train_id).order_by(TrainConsolidatedInfo.train_id)
-            return records
+                TrainConsolidatedInfo.train_id == train_id)
+            return list(records)
         except Exception as e:
-            Log.logger.critical("habd_api: select_train_consolidated_info: exception : {e}", exc_info=True)
+            Log.logger.critical(f"habd_api: select_train_consolidated_info: exception : {e}", exc_info=True)
             self.dlm_pub.publish_error_info("dlm", "DLM-ERROR-020", EventErrorPub.CRITICAL,
                                             "habd_api: select_train_consolidated_info : exception : " + str(e))
+            return []
 
     def insert_habd_error_info(self, data):
         ''' Insert error info in table '''
@@ -329,7 +524,8 @@ class HabdAPI:
         try:
             event_query = (EventInfo.delete().where(
                 fn.to_timestamp(EventInfo.ts) < datetime.now() + timedelta(days=-180, hours=0)))
-            event_query.execute()
+            deleted_count = event_query.execute()
+            Log.logger.info(f'Deleted {deleted_count} old event records')
         except Exception as e:
             Log.logger.critical(f'habd_api: event_info_mem_mgmt : exception : {e}', exc_info=True)
             self.dlm_pub.publish_error_info("dlm", "DLM-ERROR-023", EventErrorPub.CRITICAL,
@@ -340,10 +536,12 @@ class HabdAPI:
         try:
             error_query = (ErrorInfo.delete().where(
                 fn.to_timestamp(ErrorInfo.ts) < datetime.now() + timedelta(days=-180, hours=0)))
-            error_query.execute()
+            deleted_count = error_query.execute()
+            Log.logger.info(f'Deleted {deleted_count} old error records')
         except Exception as e:
             Log.logger.critical(f'habd_api: error_info_mem_mgmt: exception : {e}', exc_info=True)
-
+            self.dlm_pub.publish_error_info("dlm", "DLM-ERROR-024", EventErrorPub.CRITICAL,
+                                            "habd_api: error_info_mem_mgmt : exception : " + str(e))
 
     def insert_habd_health_info(self, data):
         ''' Insert health info in table '''
@@ -386,7 +584,8 @@ class HabdAPI:
         try:
             health_query = (HealthInfo.delete().where(
                 fn.to_timestamp(HealthInfo.ts) < datetime.now() + timedelta(days=-180, hours=0)))
-            health_query.execute()
+            deleted_count = health_query.execute()
+            Log.logger.info(f'Deleted {deleted_count} old health records')
         except Exception as e:
             Log.logger.critical(f'habd_api: health_info_mem_mgmt: exception : {e}', exc_info=True)
             self.dlm_pub.publish_error_info("dlm", "DLM-ERROR-026", EventErrorPub.CRITICAL,
@@ -395,10 +594,10 @@ class HabdAPI:
 
 if __name__ == '__main__':
     if Log.logger is None:
-        my_log = Log("habd_api")
+        my_log = Log("dlm")
 
     cfg = HabdDlmConfRead()
-    cfg.read_cfg('../config/habd_dlm.conf')
+    cfg.read_cfg('/home/l2m/habd-v1/config/habd_dlm.conf')
 
     mqtt_client = MqttClient("127.0.0.1", 1883, "dlm-api", '', '', 'dlm-api')
     mqtt_client.connect()
@@ -408,9 +607,8 @@ if __name__ == '__main__':
     db_conn = habd_api.connect_database(cfg)
 
     if db_conn:
-        # habd_api.test_insert_train_processed_info()
         habd_api.train_consolidated_info_mem_mgmt()
         habd_api.event_info_mem_mgmt()
         habd_api.error_info_mem_mgmt()
     else:
-        pass
+        Log.logger.error("Failed to connect to database")
